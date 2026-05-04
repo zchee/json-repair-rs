@@ -169,16 +169,16 @@ enum Context {
 }
 
 #[derive(Debug)]
-struct Parser {
-    chars: Vec<char>,
+struct Parser<'a> {
+    input: &'a str,
     index: usize,
     strict: bool,
 }
 
-impl Parser {
-    fn new(input: &str, strict: bool) -> Self {
+impl<'a> Parser<'a> {
+    fn new(input: &'a str, strict: bool) -> Self {
         Self {
-            chars: input.chars().collect(),
+            input,
             index: 0,
             strict,
         }
@@ -186,7 +186,7 @@ impl Parser {
 
     fn parse_top_level(&mut self) -> Result<Option<Value>, RepairError> {
         let mut values = Vec::new();
-        while self.index < self.chars.len() {
+        while self.index < self.input.len() {
             let before = self.index;
             if let Some(value) = self.parse_value(Context::Top)?
                 && !is_empty_repair(&value)
@@ -194,7 +194,7 @@ impl Parser {
                 push_top_level(&mut values, value);
             }
             if self.index <= before {
-                self.index += 1;
+                self.advance();
             }
         }
 
@@ -216,38 +216,38 @@ impl Parser {
             };
             return match ch {
                 '{' => {
-                    self.index += 1;
+                    self.advance();
                     self.parse_object().map(Some)
                 }
                 '[' => {
-                    self.index += 1;
+                    self.advance();
                     self.parse_array(']').map(Some)
                 }
                 '(' => {
                     if context == Context::Top && !self.top_level_parenthesis_can_start_value() {
-                        self.index += 1;
+                        self.advance();
                         continue;
                     }
-                    self.index += 1;
+                    self.advance();
                     self.parse_parenthesized().map(Some)
                 }
                 '\\' if matches!(self.peek_next(), Some('"' | '\'' | '“')) => {
-                    self.index += 1;
+                    self.advance();
                     self.parse_quoted_string(context)
                         .map(|s| Some(Value::String(s)))
                 }
                 '"' | '\'' | '“' => self
                     .parse_quoted_string(context)
                     .map(|s| Some(Value::String(s))),
-                '-' | '.' | '0'..='9' => Ok(Some(self.parse_numberish_or_string(context))),
-                'A'..='Z' | 'a'..='z' | '_' => {
-                    let value = self.parse_bare_word_value(context)?;
-                    if value.is_none() && context == Context::Top {
+                '-' | '.' | '0'..='9' => {
+                    if context == Context::Top
+                        && self.skip_top_level_prose_prefix_before_candidate()
+                    {
                         continue;
                     }
-                    Ok(value)
+                    Ok(Some(self.parse_numberish_or_string(context)))
                 }
-                other if other.is_alphabetic() => {
+                ch if ch.is_alphabetic() || ch == '_' => {
                     let value = self.parse_bare_word_value(context)?;
                     if value.is_none() && context == Context::Top {
                         continue;
@@ -263,7 +263,7 @@ impl Parser {
                 }
                 '}' | ']' | ')' if context != Context::Top => Ok(None),
                 _ => {
-                    self.index += 1;
+                    self.advance();
                     if context == Context::Top {
                         continue;
                     }
@@ -280,7 +280,7 @@ impl Parser {
             match self.peek() {
                 None => break,
                 Some('}') => {
-                    self.index += 1;
+                    self.advance();
                     break;
                 }
                 Some(']') | Some(')') => break,
@@ -294,7 +294,7 @@ impl Parser {
             let key = self.parse_object_key()?;
             self.skip_ws_and_comments();
             if self.peek() == Some(':') {
-                self.index += 1;
+                self.advance();
             } else if matches!(self.peek(), Some(',') | Some('}')) {
                 return self.parse_set_like_object(key);
             } else if key.is_empty() && matches!(self.peek(), Some('}') | None) {
@@ -318,9 +318,9 @@ impl Parser {
 
             self.skip_ws_and_comments();
             if self.peek() == Some(',') {
-                self.index += 1;
+                self.advance();
             } else if self.peek() == Some('}') {
-                self.index += 1;
+                self.advance();
                 break;
             }
         }
@@ -334,12 +334,12 @@ impl Parser {
             match self.peek() {
                 None => break,
                 Some(ch) if ch == closing => {
-                    self.index += 1;
+                    self.advance();
                     break;
                 }
                 Some('}') if closing == ']' => break,
                 Some(')') if closing == ']' => {
-                    self.index += 1;
+                    self.advance();
                     break;
                 }
                 _ => {}
@@ -349,7 +349,7 @@ impl Parser {
                 let key = self.parse_object_key()?;
                 self.skip_ws_and_comments();
                 if self.peek() == Some(':') {
-                    self.index += 1;
+                    self.advance();
                 }
                 let value = self
                     .parse_value(Context::ObjectValue)?
@@ -362,12 +362,12 @@ impl Parser {
                     values.push(value);
                 }
             } else if self.peek().is_some() {
-                self.index += 1;
+                self.advance();
             }
 
             self.skip_ws_and_comments();
             if self.peek() == Some(',') {
-                self.index += 1;
+                self.advance();
             }
         }
         Ok(Value::Array(values))
@@ -389,15 +389,15 @@ impl Parser {
     fn parse_object_key(&mut self) -> Result<String, RepairError> {
         self.skip_ws_and_comments();
         if self.peek() == Some('\\') && matches!(self.peek_next(), Some('"' | '\'' | '“')) {
-            self.index += 1;
+            self.advance();
         }
         match self.peek() {
             Some('"' | '\'' | '“') => self.parse_quoted_string(Context::ObjectKey),
             Some('[') => {
-                self.index += 1;
+                self.advance();
                 let key = self.parse_bare_until(&[']', ':', ',', '}'], Context::ObjectKey);
                 if self.peek() == Some(']') {
-                    self.index += 1;
+                    self.advance();
                 }
                 Ok(clean_key(&key))
             }
@@ -412,16 +412,17 @@ impl Parser {
             return Ok(String::new());
         };
         let close = matching_quote(open);
-        self.index += 1;
+        self.advance();
         let mut out = String::new();
 
         while let Some(ch) = self.peek() {
             if ch == '\\' {
                 if self.peek_next() == Some(close) && self.escaped_quote_closes_string(context) {
-                    self.index += 2;
+                    self.advance();
+                    self.advance();
                     break;
                 }
-                self.index += 1;
+                self.advance();
                 if let Some(escaped) = self.consume_escape(close) {
                     out.push(escaped);
                 } else {
@@ -432,11 +433,11 @@ impl Parser {
 
             if ch == close {
                 if self.quote_closes_string(context) {
-                    self.index += 1;
+                    self.advance();
                     break;
                 }
                 out.push(ch);
-                self.index += 1;
+                self.advance();
                 continue;
             }
 
@@ -446,20 +447,21 @@ impl Parser {
 
             if ch == '\n' || ch == '\r' {
                 out.push(ch);
-                self.index += 1;
+                self.advance();
                 continue;
             }
 
             out.push(ch);
-            self.index += 1;
+            self.advance();
         }
 
         Ok(out.trim_end_matches('`').trim().to_string())
     }
 
     fn consume_escape(&mut self, quote: char) -> Option<char> {
+        let escape_index = self.index;
         let ch = self.peek()?;
-        self.index += 1;
+        self.advance();
         match ch {
             '"' | '\'' | '\\' | '/' => Some(ch),
             'n' => Some('\n'),
@@ -467,24 +469,52 @@ impl Parser {
             't' => Some('\t'),
             'b' => Some('\u{0008}'),
             'f' => Some('\u{000c}'),
-            'u' => self.consume_hex_escape(4),
-            'x' => self.consume_hex_escape(2),
+            'u' => self.consume_unicode_escape().or_else(|| {
+                self.index = escape_index;
+                None
+            }),
+            'x' => self
+                .consume_hex_value(2)
+                .and_then(char::from_u32)
+                .or_else(|| {
+                    self.index = escape_index;
+                    None
+                }),
             other if other == quote => Some(other),
             other => Some(other),
         }
     }
 
-    fn consume_hex_escape(&mut self, digits: usize) -> Option<char> {
-        if self.index + digits > self.chars.len() {
-            return None;
+    fn consume_unicode_escape(&mut self) -> Option<char> {
+        let value = self.consume_hex_value(4)?;
+        if (0xd800..=0xdbff).contains(&value) {
+            let saved = self.index;
+            if self.peek() == Some('\\') && self.peek_next() == Some('u') {
+                self.advance();
+                self.advance();
+                if let Some(trail) = self.consume_hex_value(4)
+                    && (0xdc00..=0xdfff).contains(&trail)
+                {
+                    let codepoint = ((value - 0xd800) << 10) + (trail - 0xdc00) + 0x1_0000;
+                    return char::from_u32(codepoint);
+                }
+            }
+            self.index = saved;
         }
-        let mut value = 0_u32;
-        for offset in 0..digits {
-            value = value.checked_mul(16)?;
-            value = value.checked_add(self.chars[self.index + offset].to_digit(16)?)?;
-        }
-        self.index += digits;
         char::from_u32(value)
+    }
+
+    fn consume_hex_value(&mut self, digits: usize) -> Option<u32> {
+        let mut index = self.index;
+        let mut value = 0_u32;
+        for _ in 0..digits {
+            let ch = self.char_at(index)?;
+            value = value.checked_mul(16)?;
+            value = value.checked_add(ch.to_digit(16)?)?;
+            index = advance_index(self.input, index);
+        }
+        self.index = index;
+        Some(value)
     }
 
     fn quote_closes_string(&self, context: Context) -> bool {
@@ -516,6 +546,32 @@ impl Parser {
         value_from_bare_token(&token)
     }
 
+    fn skip_top_level_prose_prefix_before_candidate(&mut self) -> bool {
+        let Some(candidate_index) = self.top_level_container_candidate_after_prefix() else {
+            return false;
+        };
+        let Some(prefix) = self.input.get(self.index..candidate_index) else {
+            return false;
+        };
+        if !prefix_looks_like_wrapper_prose(prefix) {
+            return false;
+        }
+        self.index = candidate_index;
+        true
+    }
+
+    fn top_level_container_candidate_after_prefix(&self) -> Option<usize> {
+        let mut index = self.index;
+        while let Some(ch) = self.char_at(index) {
+            match ch {
+                '{' | '[' | '`' => return Some(index),
+                '"' | '\'' | '“' => return None,
+                _ => index = advance_index(self.input, index),
+            }
+        }
+        None
+    }
+
     fn parse_bare_word_value(&mut self, context: Context) -> Result<Option<Value>, RepairError> {
         if context == Context::Top {
             let word = self.parse_bare_until(&['{', '[', '(', '`'], context);
@@ -525,7 +581,11 @@ impl Parser {
             if word.trim().is_empty() {
                 return Ok(None);
             }
-            return Ok(Some(value_from_bare_token(&word)));
+            let value = value_from_bare_token(&word);
+            if matches!(&value, Value::String(string) if string.split_whitespace().count() > 1) {
+                return Ok(None);
+            }
+            return Ok(Some(value));
         }
         let token = self.parse_bare_until(&[',', '}', ']', ')'], context);
         if token.trim().is_empty() {
@@ -560,51 +620,48 @@ impl Parser {
                 break;
             }
             out.push(ch);
-            self.index += 1;
+            self.advance();
         }
         out.trim().trim_end_matches('`').trim().to_string()
     }
 
     fn starts_next_object_member(&self) -> bool {
         let mut i = self.index;
-        if self.chars.get(i).is_some_and(|ch| ch.is_whitespace()) {
-            while self.chars.get(i).is_some_and(|ch| ch.is_whitespace()) {
-                i += 1;
+        if self.char_at(i).is_some_and(|ch| ch.is_whitespace()) {
+            while self.char_at(i).is_some_and(|ch| ch.is_whitespace()) {
+                i = advance_index(self.input, i);
             }
         } else {
             return false;
         }
-        match self.chars.get(i).copied() {
-            Some('"' | '\'' | '“') => {
-                let quote = matching_quote(self.chars[i]);
-                i += 1;
-                while let Some(ch) = self.chars.get(i).copied() {
+        match self.char_at(i) {
+            Some(open @ ('"' | '\'' | '“')) => {
+                let quote = matching_quote(open);
+                i = advance_index(self.input, i);
+                while let Some(ch) = self.char_at(i) {
                     if ch == quote {
-                        i += 1;
+                        i = advance_index(self.input, i);
                         break;
                     }
                     if ch == '\n' || ch == '\r' {
                         return false;
                     }
-                    i += 1;
+                    i = advance_index(self.input, i);
                 }
             }
-            Some(ch) if ch.is_alphanumeric() || ch == '_' || ch == '-' => {
-                while self
-                    .chars
-                    .get(i)
-                    .is_some_and(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '-'))
-                {
-                    i += 1;
+            Some(ch) if bare_key_character(ch) => {
+                while self.char_at(i).is_some_and(bare_key_character) {
+                    i = advance_index(self.input, i);
                 }
             }
             _ => return false,
         }
-        while self.chars.get(i).is_some_and(|ch| ch.is_whitespace()) {
-            i += 1;
+        while self.char_at(i).is_some_and(|ch| ch.is_whitespace()) {
+            i = advance_index(self.input, i);
         }
-        self.chars.get(i) == Some(&':')
+        self.char_at(i) == Some(':')
     }
+
     fn object_member_can_follow_after_quote(&self, offset: usize) -> bool {
         if !self.has_separator_after_offset(offset) {
             return false;
@@ -617,7 +674,7 @@ impl Parser {
             None => return false,
         };
         i = self.skip_ws_and_comments_from(i);
-        self.chars.get(i) == Some(&':')
+        self.char_at(i) == Some(':')
     }
 
     fn array_value_can_follow_after_quote(&self, offset: usize) -> bool {
@@ -627,56 +684,54 @@ impl Parser {
         let Some(i) = self.next_significant_index_after_comment(offset) else {
             return false;
         };
-        self.chars.get(i).is_some_and(|ch| {
-            bare_value_can_start(*ch) || matches!(ch, '"' | '\'' | '“' | '{' | '[' | '(')
+        self.char_at(i).is_some_and(|ch| {
+            bare_value_can_start(ch) || matches!(ch, '"' | '\'' | '“' | '{' | '[' | '(')
         })
     }
 
     fn array_value_can_follow_after_whitespace(&self) -> bool {
         let mut i = self.index;
-        while self.chars.get(i).is_some_and(|ch| ch.is_whitespace()) {
-            i += 1;
+        while self.char_at(i).is_some_and(|ch| ch.is_whitespace()) {
+            i = advance_index(self.input, i);
         }
-        self.chars.get(i).is_some_and(|ch| {
-            bare_value_can_start(*ch) || matches!(ch, '"' | '\'' | '“' | '{' | '[' | '(')
+        self.char_at(i).is_some_and(|ch| {
+            bare_value_can_start(ch) || matches!(ch, '"' | '\'' | '“' | '{' | '[' | '(')
         })
     }
 
     fn has_separator_after_offset(&self, offset: usize) -> bool {
-        let index = self.index + offset;
-        self.chars
-            .get(index)
-            .is_some_and(|ch| ch.is_whitespace() || *ch == '#' || *ch == '/')
+        let Some(index) = self.index_after_chars(offset) else {
+            return false;
+        };
+        self.char_at(index)
+            .is_some_and(|ch| ch.is_whitespace() || ch == '#' || ch == '/')
     }
 
     fn scan_object_key_from(&self, index: usize) -> Option<usize> {
-        match self.chars.get(index).copied()? {
+        match self.char_at(index)? {
             '"' | '\'' | '“' => {
-                let quote = matching_quote(self.chars[index]);
-                let mut i = index + 1;
-                while let Some(ch) = self.chars.get(i).copied() {
+                let quote = matching_quote(self.char_at(index)?);
+                let mut i = advance_index(self.input, index);
+                while let Some(ch) = self.char_at(i) {
                     if ch == '\\' {
-                        i = (i + 2).min(self.chars.len());
+                        i = advance_index(self.input, i);
+                        i = advance_index(self.input, i);
                         continue;
                     }
                     if ch == quote {
-                        return Some(i + 1);
+                        return Some(advance_index(self.input, i));
                     }
                     if ch == '\n' || ch == '\r' {
                         return None;
                     }
-                    i += 1;
+                    i = advance_index(self.input, i);
                 }
                 None
             }
-            ch if ch.is_alphanumeric() || ch == '_' || ch == '-' => {
+            ch if bare_key_character(ch) => {
                 let mut i = index;
-                while self
-                    .chars
-                    .get(i)
-                    .is_some_and(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '-'))
-                {
-                    i += 1;
+                while self.char_at(i).is_some_and(bare_key_character) {
+                    i = advance_index(self.input, i);
                 }
                 Some(i)
             }
@@ -685,11 +740,10 @@ impl Parser {
     }
 
     fn looks_like_array_object_entry(&self) -> bool {
-        if !matches!(
-            self.peek(),
-            Some('"' | '\'' | '“') | Some('\\') | Some('A'..='Z' | 'a'..='z' | '_' | '-' | '0'..='9')
-        ) {
-            return false;
+        match self.peek() {
+            Some('"' | '\'' | '“' | '\\') => {}
+            Some(ch) if bare_key_character(ch) => {}
+            _ => return false,
         }
         let mut probe = self.clone_probe();
         let key = match probe.parse_object_key() {
@@ -709,11 +763,11 @@ impl Parser {
             self.skip_ws_and_comments();
             match self.peek() {
                 Some(',') => {
-                    self.index += 1;
+                    self.advance();
                     self.skip_ws_and_comments();
                 }
                 Some('}') => {
-                    self.index += 1;
+                    self.advance();
                     break;
                 }
                 None => break,
@@ -721,7 +775,7 @@ impl Parser {
             }
             if matches!(self.peek(), Some('}') | None) {
                 if self.peek() == Some('}') {
-                    self.index += 1;
+                    self.advance();
                 }
                 break;
             }
@@ -734,19 +788,19 @@ impl Parser {
     }
 
     fn top_level_parenthesis_can_start_value(&self) -> bool {
-        let mut i = self.index + 1;
-        while self.chars.get(i).is_some_and(|ch| ch.is_whitespace()) {
-            i += 1;
+        let mut i = advance_index(self.input, self.index);
+        while self.char_at(i).is_some_and(|ch| ch.is_whitespace()) {
+            i = advance_index(self.input, i);
         }
         matches!(
-            self.chars.get(i),
+            self.char_at(i),
             Some('{' | '[' | '(' | '"' | '\'' | '“' | '-' | '.' | '0'..='9')
         )
     }
 
     fn clone_probe(&self) -> Self {
         Self {
-            chars: self.chars.clone(),
+            input: self.input,
             index: self.index,
             strict: self.strict,
         }
@@ -756,7 +810,7 @@ impl Parser {
         loop {
             self.skip_ws_and_comments();
             if self.peek() == Some(',') {
-                self.index += 1;
+                self.advance();
                 continue;
             }
             break;
@@ -766,25 +820,28 @@ impl Parser {
     fn skip_ws_and_comments(&mut self) {
         loop {
             while self.peek().is_some_and(char::is_whitespace) {
-                self.index += 1;
+                self.advance();
             }
             if self.peek() == Some('#') {
                 self.skip_line_comment();
                 continue;
             }
             if self.peek() == Some('/') && self.peek_next() == Some('/') {
-                self.index += 2;
+                self.advance();
+                self.advance();
                 self.skip_line_comment();
                 continue;
             }
             if self.peek() == Some('/') && self.peek_next() == Some('*') {
-                self.index += 2;
-                while self.index < self.chars.len() {
+                self.advance();
+                self.advance();
+                while self.index < self.input.len() {
                     if self.peek() == Some('*') && self.peek_next() == Some('/') {
-                        self.index += 2;
+                        self.advance();
+                        self.advance();
                         break;
                     }
-                    self.index += 1;
+                    self.advance();
                 }
                 continue;
             }
@@ -797,100 +854,120 @@ impl Parser {
             if matches!(ch, '\n' | '\r' | '}' | ']') {
                 break;
             }
-            self.index += 1;
+            self.advance();
         }
     }
 
     fn skip_code_fence_marker(&mut self) {
         while self.peek() == Some('`') {
-            self.index += 1;
+            self.advance();
         }
-        while self.peek().is_some_and(|ch| ch.is_alphabetic()) {
-            self.index += 1;
+        while self
+            .peek()
+            .is_some_and(|ch| !ch.is_whitespace() && ch != '`')
+        {
+            self.advance();
+        }
+        if self.peek() == Some('\r') {
+            self.advance();
+            if self.peek() == Some('\n') {
+                self.advance();
+            }
+        } else if self.peek() == Some('\n') {
+            self.advance();
         }
     }
 
     fn next_significant_after_comment(&self, offset: usize) -> Option<char> {
-        let mut i = self.index + offset;
+        let mut i = self.index_after_chars(offset)?;
         loop {
-            while self.chars.get(i).is_some_and(|ch| ch.is_whitespace()) {
-                i += 1;
+            while self.char_at(i).is_some_and(|ch| ch.is_whitespace()) {
+                i = advance_index(self.input, i);
             }
-            if self.chars.get(i) == Some(&'#') {
-                i = skip_line_comment_in(&self.chars, i + 1);
+            if self.char_at(i) == Some('#') {
+                i = skip_line_comment_in(self.input, advance_index(self.input, i));
                 continue;
             }
-            if self.chars.get(i) == Some(&'/') && self.chars.get(i + 1) == Some(&'/') {
-                i = skip_line_comment_in(&self.chars, i + 2);
+            if self.char_at(i) == Some('/') && char_at_next(self.input, i) == Some('/') {
+                i = advance_index(self.input, i);
+                i = skip_line_comment_in(self.input, advance_index(self.input, i));
                 continue;
             }
-            if self.chars.get(i) == Some(&'/') && self.chars.get(i + 1) == Some(&'*') {
-                i += 2;
-                while i < self.chars.len() {
-                    if self.chars.get(i) == Some(&'*') && self.chars.get(i + 1) == Some(&'/') {
-                        i += 2;
+            if self.char_at(i) == Some('/') && char_at_next(self.input, i) == Some('*') {
+                i = advance_index(self.input, i);
+                i = advance_index(self.input, i);
+                while i < self.input.len() {
+                    if self.char_at(i) == Some('*') && char_at_next(self.input, i) == Some('/') {
+                        i = advance_index(self.input, i);
+                        i = advance_index(self.input, i);
                         break;
                     }
-                    i += 1;
+                    i = advance_index(self.input, i);
                 }
                 continue;
             }
-            return self.chars.get(i).copied();
+            return self.char_at(i);
         }
     }
 
     fn next_significant_index_after_comment(&self, offset: usize) -> Option<usize> {
-        let mut i = self.index + offset;
+        let mut i = self.index_after_chars(offset)?;
         loop {
-            while self.chars.get(i).is_some_and(|ch| ch.is_whitespace()) {
-                i += 1;
+            while self.char_at(i).is_some_and(|ch| ch.is_whitespace()) {
+                i = advance_index(self.input, i);
             }
-            if self.chars.get(i) == Some(&'#') {
-                i = skip_line_comment_in(&self.chars, i + 1);
+            if self.char_at(i) == Some('#') {
+                i = skip_line_comment_in(self.input, advance_index(self.input, i));
                 continue;
             }
-            if self.chars.get(i) == Some(&'/') && self.chars.get(i + 1) == Some(&'/') {
-                i = skip_line_comment_in(&self.chars, i + 2);
+            if self.char_at(i) == Some('/') && char_at_next(self.input, i) == Some('/') {
+                i = advance_index(self.input, i);
+                i = skip_line_comment_in(self.input, advance_index(self.input, i));
                 continue;
             }
-            if self.chars.get(i) == Some(&'/') && self.chars.get(i + 1) == Some(&'*') {
-                i += 2;
-                while i < self.chars.len() {
-                    if self.chars.get(i) == Some(&'*') && self.chars.get(i + 1) == Some(&'/') {
-                        i += 2;
+            if self.char_at(i) == Some('/') && char_at_next(self.input, i) == Some('*') {
+                i = advance_index(self.input, i);
+                i = advance_index(self.input, i);
+                while i < self.input.len() {
+                    if self.char_at(i) == Some('*') && char_at_next(self.input, i) == Some('/') {
+                        i = advance_index(self.input, i);
+                        i = advance_index(self.input, i);
                         break;
                     }
-                    i += 1;
+                    i = advance_index(self.input, i);
                 }
                 continue;
             }
-            return self.chars.get(i).map(|_| i);
+            return self.char_at(i).map(|_| i);
         }
     }
 
     fn skip_ws_and_comments_from(&self, mut index: usize) -> usize {
         loop {
-            while self.chars.get(index).is_some_and(|ch| ch.is_whitespace()) {
-                index += 1;
+            while self.char_at(index).is_some_and(|ch| ch.is_whitespace()) {
+                index = advance_index(self.input, index);
             }
-            if self.chars.get(index) == Some(&'#') {
-                index = skip_line_comment_in(&self.chars, index + 1);
+            if self.char_at(index) == Some('#') {
+                index = skip_line_comment_in(self.input, advance_index(self.input, index));
                 continue;
             }
-            if self.chars.get(index) == Some(&'/') && self.chars.get(index + 1) == Some(&'/') {
-                index = skip_line_comment_in(&self.chars, index + 2);
+            if self.char_at(index) == Some('/') && char_at_next(self.input, index) == Some('/') {
+                index = advance_index(self.input, index);
+                index = skip_line_comment_in(self.input, advance_index(self.input, index));
                 continue;
             }
-            if self.chars.get(index) == Some(&'/') && self.chars.get(index + 1) == Some(&'*') {
-                index += 2;
-                while index < self.chars.len() {
-                    if self.chars.get(index) == Some(&'*')
-                        && self.chars.get(index + 1) == Some(&'/')
+            if self.char_at(index) == Some('/') && char_at_next(self.input, index) == Some('*') {
+                index = advance_index(self.input, index);
+                index = advance_index(self.input, index);
+                while index < self.input.len() {
+                    if self.char_at(index) == Some('*')
+                        && char_at_next(self.input, index) == Some('/')
                     {
-                        index += 2;
+                        index = advance_index(self.input, index);
+                        index = advance_index(self.input, index);
                         break;
                     }
-                    index += 1;
+                    index = advance_index(self.input, index);
                 }
                 continue;
             }
@@ -899,11 +976,44 @@ impl Parser {
     }
 
     fn peek(&self) -> Option<char> {
-        self.chars.get(self.index).copied()
+        self.char_at(self.index)
     }
 
     fn peek_next(&self) -> Option<char> {
-        self.chars.get(self.index + 1).copied()
+        char_at_next(self.input, self.index)
+    }
+
+    fn char_at(&self, index: usize) -> Option<char> {
+        char_at(self.input, index)
+    }
+
+    fn advance(&mut self) {
+        self.index = advance_index(self.input, self.index);
+    }
+
+    fn index_after_chars(&self, count: usize) -> Option<usize> {
+        let mut index = self.index;
+        for _ in 0..count {
+            self.char_at(index)?;
+            index = advance_index(self.input, index);
+        }
+        Some(index)
+    }
+}
+
+fn char_at(input: &str, index: usize) -> Option<char> {
+    input.get(index..)?.chars().next()
+}
+
+fn char_at_next(input: &str, index: usize) -> Option<char> {
+    let next = advance_index(input, index);
+    char_at(input, next)
+}
+
+fn advance_index(input: &str, index: usize) -> usize {
+    match char_at(input, index) {
+        Some(ch) => index + ch.len_utf8(),
+        None => input.len(),
     }
 }
 
@@ -926,12 +1036,24 @@ fn bare_value_can_start(ch: char) -> bool {
     matches!(ch, '-' | '.' | '0'..='9' | '_' | 'A'..='Z' | 'a'..='z') || ch.is_alphabetic()
 }
 
-fn skip_line_comment_in(chars: &[char], mut index: usize) -> usize {
-    while let Some(ch) = chars.get(index) {
-        if *ch == '\n' || *ch == '\r' {
+fn bare_key_character(ch: char) -> bool {
+    ch.is_alphanumeric() || matches!(ch, '_' | '-')
+}
+
+fn prefix_looks_like_wrapper_prose(prefix: &str) -> bool {
+    let trimmed = prefix.trim();
+    !trimmed.is_empty()
+        && (trimmed.contains(':')
+            || trimmed.chars().any(char::is_alphabetic)
+            || (trimmed.contains('-') && trimmed.chars().any(char::is_whitespace)))
+}
+
+fn skip_line_comment_in(input: &str, mut index: usize) -> usize {
+    while let Some(ch) = char_at(input, index) {
+        if ch == '\n' || ch == '\r' {
             break;
         }
-        index += 1;
+        index = advance_index(input, index);
     }
     index
 }
@@ -1143,6 +1265,79 @@ mod tests {
         assert_eq!(
             repair_json(r#"{"key":"value☺"}"#).expect("repair"),
             r#"{"key": "value\u263a"}"#
+        );
+    }
+
+    #[test]
+    fn repairs_unicode_without_preallocating_chars() {
+        assert_eq!(
+            repair_json("{city: 東京, greeting: 'こんにちは'}").expect("repair"),
+            r#"{"city": "\u6771\u4eac", "greeting": "\u3053\u3093\u306b\u3061\u306f"}"#
+        );
+    }
+
+    #[test]
+    fn repairs_date_prefixed_prose_before_object() {
+        assert_eq!(
+            repair_json("2026-05-05 result: {a:1}").expect("repair"),
+            r#"{"a": 1}"#
+        );
+    }
+
+    #[test]
+    fn repairs_non_alpha_markdown_json_fences() {
+        assert_eq!(
+            repair_json("```json5\n{a:1}\n```").expect("repair"),
+            r#"{"a": 1}"#
+        );
+        assert_eq!(
+            repair_json("```jsonc\n{a:1,}\n```").expect("repair"),
+            r#"{"a": 1}"#
+        );
+    }
+
+    #[test]
+    fn repairs_unicode_bare_key_in_array_object_entry() {
+        assert_eq!(
+            repair_json("[東京: 1]").expect("repair"),
+            r#"[{"\u6771\u4eac": 1}]"#
+        );
+    }
+
+    #[test]
+    fn repairs_surrogate_pair_escapes() {
+        let options = RepairOptions {
+            skip_json_loads: true,
+            ensure_ascii: true,
+            ..RepairOptions::default()
+        };
+        assert_eq!(
+            repair_json_with_options(r#"{"emoji": "\ud83d\ude00"}"#, options).expect("repair"),
+            r#"{"emoji": "\ud83d\ude00"}"#
+        );
+
+        let options = RepairOptions {
+            skip_json_loads: true,
+            ensure_ascii: false,
+            ..RepairOptions::default()
+        };
+        assert_eq!(
+            repair_json_with_options(r#"{"emoji": "\ud83d\ude00"}"#, options).expect("repair"),
+            "{\"emoji\": \"😀\"}"
+        );
+    }
+
+    #[test]
+    fn preserves_lone_surrogate_escape_digits() {
+        let options = RepairOptions {
+            skip_json_loads: true,
+            ensure_ascii: true,
+            ..RepairOptions::default()
+        };
+        assert_eq!(
+            repair_json_with_options(r#"{"lead": "\ud83d", "trail": "\ude00"}"#, options)
+                .expect("repair"),
+            r#"{"lead": "\\ud83d", "trail": "\\ude00"}"#
         );
     }
 

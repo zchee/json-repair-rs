@@ -12,7 +12,7 @@ struct Args {
     /// Input file. Reads stdin when omitted.
     input: Option<PathBuf>,
 
-    /// Return a parsed JSON object serialized by serde_json instead of Python-style spacing.
+    /// Pretty-print the repaired JSON value with serde_json instead of Python-style spacing.
     #[arg(long)]
     object: bool,
 
