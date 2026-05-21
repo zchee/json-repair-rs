@@ -3,7 +3,7 @@ name = "json-repair-rs"
 version = "0.1.0"
 edition = "2024"
 description = "Repair malformed JSON strings from LLMs, logs, and user input"
-license = "MIT"
+license = "Apache-2.0"
 repository = "https://github.com/zchee/json-repair-rs"
 
 [lib]
